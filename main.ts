@@ -16,29 +16,35 @@
 //      body carries the same object, byte for byte.
 //   3. Listen, POST $MAKEFUN_ENV_URL/register {protocol_version: 1, port,
 //      catalog}, then serve the client's requests one at a time, in manifest
-//      order: rank the free models that meet the request's requirements by
-//      the quality table's rating, try them best-first, and fail over to the
-//      next when a provider refuses (402/429 or any non-2xx).
+//      order: each request goes to the primary provider the workload plan
+//      assigned it (see the routing rules below), failing over to the
+//      plan's next choice when a provider refuses (402/429 or any non-2xx).
 //   4. Poll GET $MAKEFUN_ENV_URL/work and exit 0 when it says done.
 //
 // The routing rules that matter:
 //   - A paid model is never a candidate: the brief's quality table lists the
 //     free models only, so a candidate must have a row there and be listed
 //     by its provider's own catalog route.
-//   - A provider's per-trial budget is drawn per trial and never published,
-//     but the roster's budget ranges are part of the competition's fixed
-//     provider table, so primary picks are planned under each range's low
-//     end (PLANNING_CALL_CAPS): a plan under the low end can never overrun
-//     the drawn budget. Failovers may pass the cap; a refusal just moves the
-//     request to the next candidate. After a refusal, the retry leads with
-//     any provider the trial has not counted a call on yet: schedules and
-//     outages bite only from a provider's second counted call, so a first
-//     call cannot refuse, and the failover lands in one call instead of
-//     chaining through tried providers' next call numbers. A provider
-//     that refuses three times is treated as
-//     down for the rest of the trial (a schedule holds at most two refusals,
-//     so a third means an outage or a spent budget) and drops to the back
-//     of every later ranking.
+//   - Routing is planned, not greedy (v2). A provider's per-trial budget is
+//     drawn per trial and never published, but the roster's budget ranges
+//     are part of the competition's fixed provider table, and its failure
+//     schedule holds one or two call numbers drawn from 2..budget-1, with
+//     one provider's schedule always holding call 2 and one provider going
+//     out at a drawn call number. So a first counted call can never refuse,
+//     and every later call refuses with a probability that falls as the
+//     provider's budget range grows: about 1.6/(budget-2) per call. Before
+//     the first request the server plans the whole workload at once: each
+//     request gets a primary provider chosen to minimise the sum of
+//     expected wasted calls (priced per call) plus the quality table's
+//     rating loss against the request's best, under two hard rules — a
+//     provider's planned primaries never pass its range's low end, so a
+//     primary can never overrun the drawn budget, and the plan's total
+//     rating loss stays under a cap that keeps the quality column at its
+//     ceiling. After any refusal the plan is recomputed for the requests
+//     left, with the refused provider's risk repriced from what the trial
+//     has shown: one refusal consumes about one scheduled failure, a
+//     success after a refusal rules an outage out, and two refusals in a
+//     row are priced as an outage until a success proves otherwise.
 //   - The provider echoes what it parsed of the request it received, and the
 //     client compares that echo with what it sent: the system prompt, the
 //     user text, the tool names, max_tokens, the stop sequences, the image
@@ -936,33 +942,50 @@ const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /**
- * Planning caps for primary picks: the low end of each provider's free-tier
- * budget range in the competition's fixed provider table. A trial's drawn
- * budget never falls below its range's low end, so a primary plan under the
- * caps can never overrun a budget; failovers may pass a cap, and a refusal
- * just moves the request on. Providers the table does not name get the
- * conservative default.
+ * Each provider's free-tier budget range in the competition's fixed
+ * provider table: a trial draws the budget inside [low, high], so the draw
+ * is never published but its range is. Primary picks are planned under the
+ * low end, so a planned primary can never overrun the drawn budget.
+ * Providers the table does not name get the conservative default range.
  */
-const PLANNING_CALL_CAPS: Record<string, number> = {
-  groq: 9,
-  cerebras: 5,
-  gemini: 6,
-  zai: 4,
-  openrouter: 10,
-  sambanova: 4,
-  pollinations: 10,
-  cloudflare: 7,
-  ovh: 5,
-  kilol: 12,
+const PROVIDER_BUDGET_RANGES: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
 };
-const DEFAULT_CALL_CAP = 4;
+const DEFAULT_BUDGET_RANGE: [number, number] = [4, 5];
+
+function budgetRangeOf(providerId: string): [number, number] {
+  return PROVIDER_BUDGET_RANGES[providerId] ?? DEFAULT_BUDGET_RANGE;
+}
+
+/** The most primary calls a plan may assign one provider: its range's low end. */
+function primaryCapOf(providerId: string): number {
+  return budgetRangeOf(providerId)[0];
+}
+
 /**
- * Refusals after which a provider is treated as down for the rest of the
- * trial. A provider's failure schedule holds at most two calls, so a third
- * refusal means an outage or a spent budget, never another scheduled blip:
- * demoting at two would throw away a healthy provider's remaining calls.
+ * The planner prices one expected wasted call against rating points: a
+ * candidate's cost is its next call's refusal risk times the price, plus
+ * the weighted rating it gives up against the request's best model. The
+ * planner tries prices from the ladder's top and keeps the first plan
+ * that keeps the trial's total weighted rating loss — what the requests
+ * already served banked, plus what the plan still gives up — under
+ * PLAN_LOSS_CAP, loose enough that the quality column keeps its ceiling
+ * (the ceiling leaves ~380 weighted milli-points of slack on this
+ * workload, and a refusal's repair can still add a little on top),
+ * tight enough that the plan never trades real quality for call savings
+ * it does not need. The last price, 0, plans on rating alone.
  */
-const DOWN_AFTER_REFUSALS = 3;
+const WASTE_PRICE_LADDER = [320, 260, 180, 130, 90, 40, 0];
+const PLAN_LOSS_CAP = 300;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -977,6 +1000,11 @@ interface State {
   catalog: Catalog;
   attempts: Map<string, number>;
   refusals: Map<string, number>;
+  streaks: Map<string, number>;
+  bankedLoss: number;
+  plan: Map<number, Candidate> | null;
+  planDirty: boolean;
+  planPrice: number;
   manifest_index: number;
 }
 
@@ -989,24 +1017,22 @@ function meetsRequirements(requires: Requirement, row: RatingRow): boolean {
 }
 
 /**
- * The candidates for one request, best first. On the first attempt the order
- * is: providers not down and under their planning cap before the rest, then
- * the quality table's rating, then the planning capacity left, then ids.
- * On a retry (retry = true, after a refusal in this same request) an
- * untouched provider leads outright, whatever its rating: failure
- * schedules and outages only bite from a provider's second counted call
- * on, and every budget holds at least four, so a provider's first counted
- * call of the trial cannot refuse. A guaranteed answer ends the failover
- * in one call; chaining through tried providers instead — each with its
- * own few-in-a-range chance that its next call number is a scheduled
- * refusal — cost up to four calls a request in practice, for rating
- * differences of a few tens of milli-points that the quality column's
- * rounding never showed. Tried providers return to the ranking, in the
- * usual order, only once no untouched provider can serve the request.
- * Every key is a function of the brief and the answers seen so far, so
- * the order is replay-stable.
+ * The quality column's bound for one request: the best rating in the
+ * brief's table over the free models meeting its requirements — the
+ * wire a model sits on does not enter it, only the requirements do.
  */
-function candidatesFor(state: State, requires: Requirement, jsonMode: boolean, retry: boolean): Candidate[] {
+function bestRatingFor(state: State, requires: Requirement): number {
+  let top = 0;
+  for (const row of state.brief.ratings.values()) {
+    if (!row.free) continue;
+    if (!meetsRequirements(requires, row)) continue;
+    if (row.rating_milli > top) top = row.rating_milli;
+  }
+  return top;
+}
+
+/** Every candidate that could serve a request with these requirements, unordered. */
+function feasibleCandidates(state: State, requires: Requirement, jsonMode: boolean): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of state.probes) {
     if (!probe.ok) continue;
@@ -1020,29 +1046,214 @@ function candidatesFor(state: State, requires: Requirement, jsonMode: boolean, r
       out.push({ provider: probe.provider, model: model.id, row });
     }
   }
-  const key = (c: Candidate): [number, number, number, number, number, string, string] => {
-    const attempts = state.attempts.get(c.provider.id) ?? 0;
-    const cap = PLANNING_CALL_CAPS[c.provider.id] ?? DEFAULT_CALL_CAP;
-    return [
-      retry && attempts > 0 ? 1 : 0,
-      (state.refusals.get(c.provider.id) ?? 0) >= DOWN_AFTER_REFUSALS ? 1 : 0,
-      attempts >= cap ? 1 : 0,
-      -c.row.rating_milli,
-      attempts - cap,
-      c.provider.id,
-      c.model,
-    ];
-  };
-  out.sort((a, b) => {
-    const ka = key(a);
-    const kb = key(b);
-    for (let i = 0; i < ka.length; i++) {
-      if (ka[i] < kb[i]) return -1;
-      if (ka[i] > kb[i]) return 1;
-    }
-    return 0;
-  });
   return out;
+}
+
+/**
+ * The probability that counted call number `callNumber` to this provider
+ * refuses on its failure schedule or its outage (the budget is priced
+ * separately, in budgetRisk). Before any observation the density is the
+ * draw's: one or two scheduled numbers in 2..budget-1 (1.5 in
+ * expectation) plus the one outage in ten providers starting somewhere
+ * in the same span — about 1.6/(budget-2) a call, with a bump on call 2,
+ * which one provider's schedule is guaranteed to hold. Observations
+ * reprice it: a refusal consumes about one scheduled number; a success
+ * after a refusal rules an outage out; a second refusal with a success
+ * since the first leaves the schedule most likely spent (0.18, the
+ * residue being an outage that began exactly there); two refusals in a
+ * row are priced as an outage, 0.85, until a success proves otherwise.
+ */
+function scheduleRisk(state: State, providerId: string, callNumber: number): number {
+  if (callNumber <= 1) return 0;
+  const [low, high] = budgetRangeOf(providerId);
+  const mid = (low + high) / 2;
+  const attempts = state.attempts.get(providerId) ?? 0;
+  const refusals = state.refusals.get(providerId) ?? 0;
+  const streak = state.streaks.get(providerId) ?? 0;
+  if (streak >= 2) return 0.85;
+  if (refusals === 0) {
+    return Math.min(0.95, 1.6 / (mid - 2) + (callNumber === 2 ? 0.06 : 0));
+  }
+  if (refusals >= 2) return streak === 1 ? 0.18 : 0.02;
+  // Exactly one refusal so far.
+  if (streak === 0) {
+    // A success followed it: no outage, one scheduled number spent.
+    return Math.min(0.9, 0.5 / Math.max(1, mid - 1 - attempts));
+  }
+  // The refusal was the provider's latest answer: it may have been the
+  // outage beginning (posterior ~0.07) or one scheduled number, of which
+  // about half of one remains in expectation over the numbers left.
+  return Math.min(0.9, 0.07 + (0.93 * 0.5) / Math.max(1, mid - 1 - attempts));
+}
+
+/** The probability that this call number overruns the provider's drawn budget. */
+function budgetRisk(providerId: string, callNumber: number): number {
+  const [low, high] = budgetRangeOf(providerId);
+  if (callNumber <= low) return 0;
+  if (callNumber > high) return 1;
+  return (callNumber - low) / (high - low + 1);
+}
+
+/** The probability that counted call number `callNumber` to this provider refuses at all. */
+function callRisk(state: State, providerId: string, callNumber: number): number {
+  const s = scheduleRisk(state, providerId, callNumber);
+  const b = budgetRisk(providerId, callNumber);
+  return 1 - (1 - s) * (1 - b);
+}
+
+interface PlanOutcome {
+  plan: Map<number, Candidate>;
+  loss: number;
+}
+
+/**
+ * One greedy pass over the requests from `fromIndex` on, at one waste
+ * price: the most constrained requests are placed first, each on the
+ * feasible provider whose next planned call is cheapest — its refusal
+ * risk at the price, plus the weighted rating it gives up against the
+ * request's best model. A provider's planned calls, on top of the calls
+ * already counted, stay under its budget range's low end unless every
+ * feasible provider for the request is already there (the over-cap
+ * penalty), so a planned primary can only refuse on a schedule or an
+ * outage, never on a spent budget. Ties break on rating, then ids, so
+ * the pass is a pure function of the brief and the outcomes seen so far.
+ */
+function planWithPrice(state: State, fromIndex: number, currentTried: Set<string>, price: number): PlanOutcome {
+  const manifest = state.brief.manifest;
+  const planned = new Map<string, number>();
+  const plan = new Map<number, Candidate>();
+  let loss = 0;
+  const feasible = new Map<number, Candidate[]>();
+  const best = new Map<number, number>();
+  const order: number[] = [];
+  for (let i = fromIndex; i < manifest.length; i++) {
+    const entry = manifest[i];
+    const list = feasibleCandidates(state, entry.requires, entry.requires.json === true && entry.api === 'openai');
+    feasible.set(i, list);
+    best.set(i, list.reduce((m, c) => Math.max(m, c.row.rating_milli), 0));
+    order.push(i);
+  }
+  order.sort((a, b) => {
+    const pa = new Set((feasible.get(a) ?? []).map((c) => c.provider.id)).size;
+    const pb = new Set((feasible.get(b) ?? []).map((c) => c.provider.id)).size;
+    if (pa !== pb) return pa - pb;
+    if (manifest[a].weight !== manifest[b].weight) return manifest[b].weight - manifest[a].weight;
+    return a - b;
+  });
+  for (const i of order) {
+    const entry = manifest[i];
+    const top = best.get(i) ?? 0;
+    let chosen: Candidate | undefined;
+    let chosenCost = Infinity;
+    for (const c of feasible.get(i) ?? []) {
+      if (i === fromIndex && currentTried.has(c.provider.id)) continue;
+      const already = (state.attempts.get(c.provider.id) ?? 0) + (planned.get(c.provider.id) ?? 0);
+      const overCap = already + 1 > primaryCapOf(c.provider.id) ? 100000 : 0;
+      const cost = callRisk(state, c.provider.id, already + 1) * price + (top - c.row.rating_milli) * entry.weight + overCap;
+      if (
+        cost < chosenCost ||
+        (cost === chosenCost &&
+          chosen !== undefined &&
+          (c.row.rating_milli > chosen.row.rating_milli ||
+            (c.row.rating_milli === chosen.row.rating_milli &&
+              (c.provider.id < chosen.provider.id || (c.provider.id === chosen.provider.id && c.model < chosen.model)))))
+      ) {
+        chosen = c;
+        chosenCost = cost;
+      }
+    }
+    if (chosen === undefined) continue;
+    plan.set(i, chosen);
+    planned.set(chosen.provider.id, (planned.get(chosen.provider.id) ?? 0) + 1);
+    loss += (top - chosen.row.rating_milli) * entry.weight;
+  }
+  return { plan, loss };
+}
+
+/**
+ * The workload plan: primaries for every request from `fromIndex` on.
+ * Prices from the ladder are tried in order and the first plan under the
+ * loss cap wins; if none qualifies, the lowest-loss plan is used. The
+ * plan is recomputed whenever a call's outcome has moved the counts the
+ * last plan was built on.
+ */
+function computePlan(state: State, fromIndex: number, currentTried: Set<string>): Map<number, Candidate> {
+  let fallback: PlanOutcome | null = null;
+  for (const price of WASTE_PRICE_LADDER) {
+    const outcome = planWithPrice(state, fromIndex, currentTried, price);
+    if (fallback === null || outcome.loss < fallback.loss) fallback = outcome;
+    if (state.bankedLoss + outcome.loss <= PLAN_LOSS_CAP) {
+      state.planPrice = price;
+      return outcome.plan;
+    }
+  }
+  state.planPrice = 0;
+  return fallback?.plan ?? new Map();
+}
+
+/**
+ * The repair pick for a request whose primary has refused. A provider
+ * the trial has not counted a call on yet cannot refuse, so its cost is
+ * exactly its rating loss; a counted provider costs its loss plus its
+ * next call's refusal risk at a fixed price (150 loss points — what the
+ * plan-level exchange rates one wasted call at), so an untouched
+ * provider wins whenever its rating is competitive, but a dregs-only
+ * untouched pool no longer forces an 85-point loss against a top-rated
+ * counted provider at moderate risk. (Two earlier shapes failed here:
+ * pricing repairs at the plan's own price chained them through second
+ * calls — the draw's densest refusal numbers — when that price ran low;
+ * and an absolute untouched-first rule spent the quality budget late in
+ * the trial, when the untouched pool is what is left over.) A hard
+ * guard rides on top: a pick that would push the trial's banked loss
+ * past 340 of the ~380 the quality ceiling leaves is penalised until
+ * only near-free rating qualifies.
+ */
+function repairPick(state: State, entry: WorkloadRequest | undefined, requires: Requirement, jsonMode: boolean, tried: Set<string>): Candidate | undefined {
+  const feasible = feasibleCandidates(state, requires, jsonMode).filter((c) => !tried.has(c.provider.id));
+  if (feasible.length === 0) return undefined;
+  const weight = entry?.weight ?? 1;
+  const bound = bestRatingFor(state, requires);
+  const lossOf = (c: Candidate): number => (bound - c.row.rating_milli) * weight;
+  let chosen: Candidate | undefined;
+  let chosenCost = Infinity;
+  for (const c of feasible) {
+    const next = (state.attempts.get(c.provider.id) ?? 0) + 1;
+    const loss = lossOf(c);
+    const cost = loss + callRisk(state, c.provider.id, next) * 150 + Math.max(0, state.bankedLoss + loss - 340) * 20;
+    if (
+      cost < chosenCost ||
+      (cost === chosenCost &&
+        chosen !== undefined &&
+        (c.row.rating_milli > chosen.row.rating_milli ||
+          (c.row.rating_milli === chosen.row.rating_milli &&
+            (c.provider.id < chosen.provider.id || (c.provider.id === chosen.provider.id && c.model < chosen.model)))))
+    ) {
+      chosen = c;
+      chosenCost = cost;
+    }
+  }
+  return chosen;
+}
+
+/**
+ * The next provider to try for the request being served: on the first
+ * attempt, the plan's primary for it, while that provider is still
+ * feasible for the request as it actually arrived and has not been
+ * tried for it; after a refusal, the repair pick (see repairPick).
+ */
+function pickCandidate(state: State, entry: WorkloadRequest | undefined, requires: Requirement, jsonMode: boolean, tried: Set<string>): Candidate | undefined {
+  const index = state.manifest_index - 1;
+  if (state.planDirty || state.plan === null) {
+    state.plan = computePlan(state, Math.max(0, index), tried);
+    state.planDirty = false;
+  }
+  if (tried.size > 0) return repairPick(state, entry, requires, jsonMode, tried);
+  const feasibleKeys = new Set(feasibleCandidates(state, requires, jsonMode).map((c) => `${c.provider.id}\n${c.model}`));
+  const planned = state.plan.get(index);
+  if (planned !== undefined && feasibleKeys.has(`${planned.provider.id}\n${planned.model}`)) {
+    return planned;
+  }
+  return repairPick(state, entry, requires, jsonMode, tried);
 }
 
 /** The free model ids this entry serves, deduplicated: what GET /v1/models lists on both wires. */
@@ -1105,18 +1316,24 @@ async function serve(state: State, clientApi: 'openai' | 'anthropic', body: Json
   const tried = new Set<string>();
   let failures = 0;
   for (;;) {
-    // Re-ranked per attempt: after a refusal the retry order leads with any
-    // provider this trial has not counted a call on yet (see candidatesFor).
-    const candidate = candidatesFor(state, requires, req.json_mode, failures > 0).find((c) => !tried.has(c.provider.id));
+    // The plan's primary for this request, replanned after every outcome
+    // (see pickCandidate): a refusal reprices the refused provider and the
+    // plan for the requests left is rebuilt before the next attempt.
+    const candidate = pickCandidate(state, entry, requires, req.json_mode, tried);
     if (candidate === undefined) break;
     tried.add(candidate.provider.id);
     state.attempts.set(candidate.provider.id, (state.attempts.get(candidate.provider.id) ?? 0) + 1);
     const answer = await callProvider(ENV_URL, candidate, req);
     if (answer === null) {
       state.refusals.set(candidate.provider.id, (state.refusals.get(candidate.provider.id) ?? 0) + 1);
+      state.streaks.set(candidate.provider.id, (state.streaks.get(candidate.provider.id) ?? 0) + 1);
+      state.planDirty = true;
       failures += 1;
       continue;
     }
+    state.streaks.set(candidate.provider.id, 0);
+    state.planDirty = true;
+    state.bankedLoss += (bestRatingFor(state, requires) - candidate.row.rating_milli) * (entry?.weight ?? 1);
     // This candidate served the request: answer in the client's wire.
     if (req.stream) {
       const text = clientApi === 'openai' ? openAIStreamAnswer(answer, candidate.model) : anthropicStreamAnswer(answer, candidate.model);
@@ -1218,7 +1435,7 @@ async function start(): Promise<void> {
     process.exit(0);
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  const state: State = { brief, probes, catalog, attempts: new Map(), refusals: new Map(), manifest_index: 0 };
+  const state: State = { brief, probes, catalog, attempts: new Map(), refusals: new Map(), streaks: new Map(), bankedLoss: 0, plan: null, planDirty: true, planPrice: 0, manifest_index: 0 };
   const server = createServer((req, res) => {
     void handle(state, req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
